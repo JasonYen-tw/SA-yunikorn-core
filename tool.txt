@@ -1,0 +1,4 @@
+tree /f > files.txt
+go build ./... 2> build_errors.log
+go test ./... > test_report.log 2>&1
+go run ./cmd/mytest

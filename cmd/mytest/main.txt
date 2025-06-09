@@ -1,0 +1,84 @@
+// package main
+
+// import (
+// 	"fmt"
+
+// 	"github.com/apache/yunikorn-core/pkg/scheduler"
+// 	"github.com/apache/yunikorn-core/pkg/scheduler/strategy"
+// 	// 如需其他必要 import，照你自己 code 補齊
+// 	// 例如 "github.com/apache/yunikorn-core/pkg/scheduler/objects"
+// )
+
+// func main() {
+// 	// 建立一個空的 config
+// 	var config []byte = nil
+
+// 	cc, err := scheduler.NewClusterContext("test", "default", config)
+// 	if err != nil {
+// 		fmt.Println("建立 ClusterContext 失敗:", err)
+// 		return
+// 	}
+
+// 	// 測試 DefaultScheduler
+// 	// cc.SetSchedulerStrategy(strategy.NewDefaultScheduler())
+// 	// cc.Schedule()
+
+// 	// 測試 SAScheduler（取消上面註解，下面啟用就可以）
+// 	cc.SetSchedulerStrategy(strategy.NewSAScheduler())
+// 	cc.Schedule()
+// }
+
+// package main
+
+// import (
+// 	"fmt"
+// 	"os"
+
+// 	"github.com/apache/yunikorn-core/pkg/common/configs"
+// 	"github.com/apache/yunikorn-core/pkg/scheduler"
+// 	"github.com/apache/yunikorn-core/pkg/scheduler/strategy"
+// )
+
+// func main() {
+// 	// 1. 讀取 YAML 檔案
+// 	yamlPath := "config/queues.yaml"
+// 	content, err := os.ReadFile(yamlPath)
+// 	if err != nil {
+// 		fmt.Printf("讀取 %s 失敗: %v\n", yamlPath, err)
+// 		os.Exit(1)
+// 	}
+
+// 	// 2. Parse YAML 成 SchedulerConfig
+// 	conf, err := configs.LoadSchedulerConfigFromByteArray(content)
+// 	if err != nil {
+// 		fmt.Printf("YAML 解析錯誤: %v\n", err)
+// 		os.Exit(1)
+// 	}
+
+// 	// 3. 建立 ClusterContext
+// 	// rmID 和 policyGroup 先給測試用字串
+// 	cc, err := scheduler.NewClusterContext("testRM", "default", content)
+// 	if err != nil {
+// 		fmt.Printf("建立 ClusterContext 失敗: %v\n", err)
+// 		os.Exit(1)
+// 	}
+
+// 	// 4. 根據 config.strategy 決定策略
+// 	var s strategy.SchedulerStrategy
+// 	switch conf.Strategy {
+// 	case "annealing":
+// 		fmt.Println("[DEBUG] 使用 SimulatedAnnealingScheduler")
+// 		s = strategy.NewSimulatedAnnealingScheduler(conf.AnnealingParams)
+// 	default:
+// 		fmt.Println("[DEBUG] 使用 DefaultScheduler")
+// 		s = &strategy.DefaultScheduler{}
+// 	}
+
+// 	// 5. 設定策略到 cc
+// 	cc.SetSchedulerStrategy(s)
+
+// 	// 6. 呼叫 Schedule
+// 	fmt.Println("[DEBUG] 開始調度")
+// 	cc.Schedule()
+// 	fmt.Println("[DEBUG] 測試完成")
+// }
