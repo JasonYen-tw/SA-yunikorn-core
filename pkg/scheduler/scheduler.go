@@ -19,12 +19,16 @@
 package scheduler
 
 import (
+	"os"
 	"reflect"
+	"runtime"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/apache/yunikorn-core/pkg/common"
 	"github.com/apache/yunikorn-core/pkg/common/resources"
+	"github.com/apache/yunikorn-core/pkg/events"
 	"github.com/apache/yunikorn-core/pkg/handler"
 	"github.com/apache/yunikorn-core/pkg/log"
 	"github.com/apache/yunikorn-core/pkg/plugins"
@@ -51,8 +55,25 @@ func NewScheduler() *Scheduler {
 	return m
 }
 
+func (s *Scheduler) logStartupEnvironment(manualSchedule bool) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	log.Log(log.Scheduler).Info("scheduler environment snapshot",
+		zap.String("uuid", s.clusterContext.GetUUID()),
+		zap.String("hostname", hostname),
+		zap.String("goVersion", runtime.Version()),
+		zap.String("goOS", runtime.GOOS),
+		zap.String("goArch", runtime.GOARCH),
+		zap.Bool("manualSchedule", manualSchedule),
+		zap.Bool("eventTrackingEnabled", events.GetEventSystem().IsEventTrackingEnabled()),
+		zap.Bool("disableReservation", common.GetBoolEnvVar(disableReservation, false)))
+}
+
 // Start service
 func (s *Scheduler) StartService(handlers handler.EventHandlers, manualSchedule bool) {
+	s.logStartupEnvironment(manualSchedule)
 	// set the proxy handler in the context
 	s.clusterContext.setEventHandler(handlers.RMProxyEventHandler)
 

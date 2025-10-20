@@ -120,6 +120,7 @@ func (cc *ClusterContext) setEventHandler(rmHandler handler.EventHandler) {
 func (cc *ClusterContext) Schedule() bool {
 	// schedule each partition defined in the cluster
 	activity := false
+	allocationSummary := make(map[string]map[string]int)
 	for _, psc := range cc.GetPartitionMapClone() {
 		// if there are no resources in the partition just skip
 		if psc.root.GetMaxResource() == nil {
@@ -137,9 +138,7 @@ func (cc *ClusterContext) Schedule() bool {
 		// 步驟 1: 優先嘗試從 SA 緩衝區獲取「建議」
 		if psc.Strategy == "annealing" {
 			if saRes := psc.PopSAResult(); saRes != nil {
-				// 我們從 SA 拿到了一個建議，現在需要讓 partition 去驗證並執行它
-				fmt.Println("[DEBUG] SimulatedAnnealingScheduler.PopSAResult called")
-				result = psc.Allocate(saRes)
+				result = psc.executeAllocation(saRes, "annealing")
 			}
 		}
 
@@ -159,6 +158,12 @@ func (cc *ClusterContext) Schedule() bool {
 
 		// 步驟 3: [統一處理] 無論 result 來自何處，都在這裡處理後續步驟
 		if result != nil {
+			if result.NodeID != "" {
+				if allocationSummary[psc.Name] == nil {
+					allocationSummary[psc.Name] = make(map[string]int)
+				}
+				allocationSummary[psc.Name][result.NodeID]++
+			}
 			// 只有在這裡，當 `result` 非空時，才意味著一次成功的、經過驗證的分配發生了
 			metrics.GetSchedulerMetrics().ObserveSchedulingLatency(schedulingStart)
 			if result.ResultType == objects.Replaced {
@@ -170,6 +175,10 @@ func (cc *ClusterContext) Schedule() bool {
 			}
 			activity = true
 		}
+	}
+	if len(allocationSummary) > 0 {
+		log.Log(log.Scheduler).Info("allocation summary for scheduling cycle",
+			zap.Any("allocationsByPartition", allocationSummary))
 	}
 	return activity
 }

@@ -21,9 +21,6 @@ package metrics
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
-	"go.uber.org/zap"
-
-	"github.com/apache/yunikorn-core/pkg/log"
 )
 
 const (
@@ -113,14 +110,9 @@ func InitQueueMetrics(name string) *QueueMetrics {
 		q.resourceMetricsSubsystem,
 	}
 
-	// Register the metrics
+	// Register the metrics. Registration might fail if the queue name is invalid.
 	for _, metric := range queueMetricsList {
-		// registration might be failed if queue name is not valid
-		// metrics name must be complied with regex: [a-zA-Z_:][a-zA-Z0-9_:]*,
-		// queue name regex: ^[a-zA-Z0-9_-]{1,64}$
-		if err := prometheus.Register(metric); err != nil {
-			log.Log(log.Metrics).Warn("failed to register metrics collector", zap.Error(err))
-		}
+		registerCollector(metric)
 	}
 
 	return q

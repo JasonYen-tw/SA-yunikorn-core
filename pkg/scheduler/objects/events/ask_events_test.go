@@ -178,3 +178,22 @@ func TestRequiredNodePreemptionFailedEvents(t *testing.T) {
 	event = eventSystem.Events[0]
 	assert.Equal(t, "Unschedulable request 'alloc-1' with required node 'node-1', no preemption victim found", event.Message)
 }
+
+func TestAllocationScheduledEvent(t *testing.T) {
+	eventSystem := mock.NewEventSystemDisabled()
+	events := NewAskEvents(eventSystem)
+	events.SendAllocationScheduled(allocKey, appID, nodeID1, "annealing", requestResource)
+	assert.Equal(t, 0, len(eventSystem.Events))
+
+	eventSystem = mock.NewEventSystem()
+	events = NewAskEvents(eventSystem)
+	events.SendAllocationScheduled(allocKey, appID, nodeID1, "annealing", requestResource)
+	assert.Equal(t, 1, len(eventSystem.Events))
+	event := eventSystem.Events[0]
+	assert.Equal(t, allocKey, event.ObjectID)
+	assert.Equal(t, appID, event.ReferenceID)
+	assert.Equal(t, si.EventRecord_REQUEST, event.Type)
+	assert.Equal(t, si.EventRecord_NONE, event.EventChangeType)
+	assert.Equal(t, si.EventRecord_DETAILS_NONE, event.EventChangeDetail)
+	assert.Equal(t, "Request 'alloc-0' scheduled on node 'node-1' via annealing", event.Message)
+}

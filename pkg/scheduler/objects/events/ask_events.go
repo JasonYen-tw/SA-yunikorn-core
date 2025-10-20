@@ -105,6 +105,18 @@ func (ae *AskEvents) SendRequiredNodePreemptionFailed(allocKey, appID, node stri
 	ae.eventSystem.AddEvent(event)
 }
 
+func (ae *AskEvents) SendAllocationScheduled(allocKey, appID, nodeID, strategy string, allocatedResource *resources.Resource) {
+	if !ae.eventSystem.IsEventTrackingEnabled() {
+		return
+	}
+	if strategy == "" {
+		strategy = "default"
+	}
+	message := fmt.Sprintf("Request '%s' scheduled on node '%s' via %s", allocKey, nodeID, strategy)
+	event := events.CreateRequestEventRecord(allocKey, appID, message, allocatedResource)
+	ae.eventSystem.AddEvent(event)
+}
+
 func NewAskEvents(evt events.EventSystem) *AskEvents {
 	return newAskEventsWithRate(evt, 15*time.Second, 1)
 }

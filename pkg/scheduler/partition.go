@@ -74,6 +74,8 @@ type PartitionContext struct {
 	saLock                 sync.Mutex                  // buffer 的保護鎖
 	saRunning              bool                        // 背景 SA 是否正在跑
 	saCond                 *sync.Cond                  // 用來喚醒 internal goroutine
+	lastSAResultCount      int
+	lastSARunTime          time.Time
 
 	// The partition write lock must not be held while manipulating an application.
 	// Scheduling is running continuously as a lock free background task. Scheduling an application
@@ -92,13 +94,108 @@ func (pc *PartitionContext) GetName() string {
 	return pc.Name
 }
 
+func (pc *PartitionContext) GetStrategy() string {
+	return pc.Strategy
+}
+
+func (pc *PartitionContext) GetStrategyStatus() (bool, int, int, time.Time) {
+	pc.saLock.Lock()
+	defer pc.saLock.Unlock()
+	pending := 0
+	if pc.SABuffer != nil {
+		pending = len(pc.SABuffer) - pc.saIndex
+		if pending < 0 {
+			pending = 0
+		}
+	}
+	return pc.saRunning, pending, pc.lastSAResultCount, pc.lastSARunTime
+}
+
+func (pc *PartitionContext) updateSAPendingMetricsLocked() {
+	pending := 0
+	if pc.SABuffer != nil {
+		pending = len(pc.SABuffer) - pc.saIndex
+		if pending < 0 {
+			pending = 0
+		}
+	}
+	metrics.GetSchedulerMetrics().SetSAPendingCandidates(pc.Name, pending)
+}
+
+func (pc *PartitionContext) logPodSchedulingStage(stage, source, status string, result *objects.AllocationResult) {
+	if result == nil || result.Request == nil {
+		return
+	}
+	alloc := result.Request
+	var queuePath string
+	if app := pc.getApplication(alloc.GetApplicationID()); app != nil {
+		queuePath = app.GetQueuePath()
+	}
+	log.Log(log.SchedPartition).Info("pod scheduling stage",
+		zap.String("partition", pc.Name),
+		zap.String("stage", stage),
+		zap.String("status", status),
+		zap.String("source", source),
+		zap.String("appID", alloc.GetApplicationID()),
+		zap.String("queue", queuePath),
+		zap.String("allocationKey", alloc.GetAllocationKey()),
+		zap.String("resultType", result.ResultType.String()),
+		zap.String("targetNode", result.NodeID),
+		zap.Bool("placeholder", alloc.IsPlaceholder()),
+		zap.String("requiredNode", alloc.GetRequiredNode()),
+		zap.Any("resource", alloc.GetAllocatedResource()))
+}
+
+func allocationStatus(result *objects.AllocationResult, succeeded bool) string {
+	if result == nil {
+		return "unknown"
+	}
+	switch result.ResultType {
+	case objects.Reserved:
+		return "reserved"
+	case objects.Unreserved:
+		return "unreserved"
+	case objects.Allocated, objects.AllocatedReserved, objects.Replaced:
+		if succeeded {
+			return "allocated"
+		}
+		return "allocationPending"
+	default:
+		if succeeded {
+			return "allocated"
+		}
+		return "skipped"
+	}
+}
+
+func (pc *PartitionContext) executeAllocation(result *objects.AllocationResult, source string) *objects.AllocationResult {
+	if result == nil {
+		return nil
+	}
+	pc.logPodSchedulingStage("pre", source, "pending", result)
+	final := pc.Allocate(result)
+	logResult := result
+	if final != nil {
+		logResult = final
+	}
+	status := allocationStatus(logResult, final != nil)
+	pc.logPodSchedulingStage("post", source, status, logResult)
+	return final
+}
+
 // 把一整批結果放進來 (覆蓋舊資料)
 func (pc *PartitionContext) LoadSAResults(results []*objects.AllocationResult) {
 	pc.saLock.Lock()
 	defer pc.saLock.Unlock()
 	pc.SABuffer = results
 	pc.saIndex = 0
-	fmt.Printf("[DEBUG] load sa results %d\n", len(results))
+	pc.lastSAResultCount = len(results)
+	pc.lastSARunTime = time.Now()
+	pc.updateSAPendingMetricsLocked()
+	metrics.GetSchedulerMetrics().SetSALastResultSize(pc.Name, len(results))
+	log.Log(log.SchedPartition).Debug("loaded annealing results into buffer",
+		zap.String("partition", pc.Name),
+		zap.Int("count", len(results)))
 }
 
 // 已鎖版本（不再重新 Lock）
@@ -107,6 +204,7 @@ func (pc *PartitionContext) ensureSARunningLocked() {
 		return
 	}
 	pc.saRunning = true
+	metrics.GetSchedulerMetrics().SetSARunning(pc.Name, true)
 	go pc.runSAInBackground()
 }
 
@@ -115,20 +213,33 @@ func (pc *PartitionContext) PopSAResult() *objects.AllocationResult {
 	pc.saLock.Lock()
 	defer pc.saLock.Unlock()
 
-	for pc.saIndex >= len(pc.SABuffer) {
-		// 確保背景 SA 正在跑
-		if resources.StrictlyGreaterThanZero(pc.root.GetPendingResource()) {
+	for {
+		if pc.saIndex < len(pc.SABuffer) {
+			res := pc.SABuffer[pc.saIndex]
+			pc.saIndex++
+			if pc.saIndex >= len(pc.SABuffer) {
+				pc.SABuffer = nil
+			}
+			pc.updateSAPendingMetricsLocked()
+			return res
+		}
+
+		// 沒有排隊資源且背景 SA 未執行時，直接返回避免無限等待
+		hasPending := false
+		if pc.root != nil {
+			hasPending = resources.StrictlyGreaterThanZero(pc.root.GetPendingResource())
+		}
+		if !hasPending && !pc.saRunning {
+			pc.updateSAPendingMetricsLocked()
+			return nil
+		}
+
+		if hasPending {
 			pc.ensureSARunningLocked()
 		}
+
 		pc.saCond.Wait() // Wait 會自動解鎖並在喚醒後重新上鎖
 	}
-
-	res := pc.SABuffer[pc.saIndex]
-	pc.saIndex++
-	if pc.saIndex >= len(pc.SABuffer) {
-		pc.SABuffer = nil
-	}
-	return res
 }
 
 // 背景執行 SA
@@ -144,13 +255,19 @@ func (pc *PartitionContext) runSAInBackground() {
 		pc.SABuffer = results
 		pc.saIndex = 0
 		if len(results) > 0 {
-			// 在這裡打印日誌，確認緩衝區已被加載
-			fmt.Printf("[DEBUG] SA buffer loaded with %d results by runSAInBackground\n", len(results))
+			log.Log(log.SchedPartition).Debug("annealing background run produced results",
+				zap.String("partition", pc.Name),
+				zap.Int("count", len(results)))
 		}
+		pc.lastSAResultCount = len(results)
+		pc.lastSARunTime = time.Now()
+		metrics.GetSchedulerMetrics().SetSALastResultSize(pc.Name, len(results))
+		pc.updateSAPendingMetricsLocked()
 
 		// 4. 判斷是否需要繼續運行
 		keepRunning := len(results) == 0 && resources.StrictlyGreaterThanZero(pc.root.GetPendingResource())
 		pc.saRunning = keepRunning
+		metrics.GetSchedulerMetrics().SetSARunning(pc.Name, keepRunning)
 
 		// 5. **喚醒所有**在 PopSAResult 中等待的消費者
 		pc.saCond.Broadcast()
@@ -185,6 +302,9 @@ func newPartitionContext(conf configs.PartitionConfig, rmID string, cc *ClusterC
 		nodes:                 objects.NewNodeCollection(conf.Name),
 	}
 	pc.saCond = sync.NewCond(&pc.saLock)
+	metrics.GetSchedulerMetrics().SetSARunning(pc.Name, false)
+	metrics.GetSchedulerMetrics().SetSAPendingCandidates(pc.Name, 0)
+	metrics.GetSchedulerMetrics().SetSALastResultSize(pc.Name, 0)
 	pc.partitionManager = newPartitionManager(pc, cc)
 	if err := pc.initialPartitionFromConfig(conf); err != nil {
 		return nil, err
@@ -217,6 +337,16 @@ func (pc *PartitionContext) initialPartitionFromConfig(conf configs.PartitionCon
 	pc.Strategy = conf.Strategy
 	if conf.Strategy == "annealing" {
 		pc.SAInstance = strategy.NewSimulatedAnnealingScheduler(conf.AnnealingParams)
+		log.Log(log.SchedPartition).Info("annealing strategy enabled",
+			zap.String("partition", pc.Name),
+			zap.Float64("initTemp", conf.AnnealingParams.InitTemp),
+			zap.Float64("coolRate", conf.AnnealingParams.CoolRate),
+			zap.Int("iterations", conf.AnnealingParams.Iterations),
+			zap.Any("weights", conf.AnnealingParams.Weights))
+	} else if conf.Strategy != "" {
+		log.Log(log.SchedPartition).Info("partition strategy configured",
+			zap.String("partition", pc.Name),
+			zap.String("strategy", conf.Strategy))
 	}
 	// We need to pass in the locked version of the GetQueue function.
 	// Placing an application will not have a lock on the partition context.
@@ -900,10 +1030,7 @@ func (pc *PartitionContext) tryAllocate() *objects.AllocationResult {
 	}
 	// try allocating from the root down
 	result := pc.root.TryAllocate(pc.GetNodeIterator, pc.GetFullNodeIterator, pc.GetNode, pc.isPreemptionEnabled())
-	if result != nil {
-		return pc.Allocate(result)
-	}
-	return nil
+	return pc.executeAllocation(result, "regular")
 }
 
 // Try process reservations for the partition
@@ -918,10 +1045,7 @@ func (pc *PartitionContext) tryReservedAllocate() *objects.AllocationResult {
 	}
 	// try allocating from the root down
 	result := pc.root.TryReservedAllocate(pc.GetNodeIterator)
-	if result != nil {
-		return pc.Allocate(result)
-	}
-	return nil
+	return pc.executeAllocation(result, "reservation")
 }
 
 // Try process placeholder for the partition
@@ -942,9 +1066,8 @@ func (pc *PartitionContext) tryPlaceholderAllocate() *objects.AllocationResult {
 			zap.String("allocationKey", result.Request.GetAllocationKey()),
 			zap.String("placeholder released allocationKey", result.Request.GetRelease().GetAllocationKey()))
 		// pass the release back to the RM via the cluster context
-		return result
 	}
-	return nil
+	return pc.executeAllocation(result, "placeholder")
 }
 
 // Process the allocation and make the left over changes in the partition.
@@ -981,6 +1104,50 @@ func (pc *PartitionContext) Allocate(result *objects.AllocationResult) *objects.
 			}
 		}
 		return nil
+	}
+
+	// For annealing results the allocation may not yet be materialised on app/queue/node state.
+	materialise := result.ResultType == objects.Allocated || result.ResultType == objects.AllocatedReserved || result.ResultType == objects.Replaced
+	if materialise && !alloc.IsAllocated() {
+		queue := app.GetQueue()
+		if queue == nil {
+			log.Log(log.SchedPartition).Warn("queue not found while allocating annealing result",
+				zap.String("appID", appID),
+				zap.String("allocationKey", alloc.GetAllocationKey()))
+			return nil
+		}
+		if !targetNode.TryAddAllocation(alloc) {
+			log.Log(log.SchedPartition).Warn("failed to add allocation to node during annealing result apply",
+				zap.String("appID", appID),
+				zap.String("allocationKey", alloc.GetAllocationKey()),
+				zap.String("nodeID", targetNodeID))
+			return nil
+		}
+		if err := queue.TryIncAllocatedResource(alloc.GetAllocatedResource()); err != nil {
+			targetNode.RemoveAllocation(alloc.GetAllocationKey())
+			log.Log(log.SchedPartition).Warn("failed to update queue allocation while applying annealing result",
+				zap.String("queue", queue.GetQueuePath()),
+				zap.String("appID", appID),
+				zap.String("allocationKey", alloc.GetAllocationKey()),
+				zap.Error(err))
+			return nil
+		}
+		if _, err := app.AllocateAsk(alloc.GetAllocationKey()); err != nil {
+			if decErr := queue.DecAllocatedResource(alloc.GetAllocatedResource()); decErr != nil {
+				log.Log(log.SchedPartition).Warn("failed to rollback queue allocation after allocate ask failure",
+					zap.String("queue", queue.GetQueuePath()),
+					zap.String("appID", appID),
+					zap.String("allocationKey", alloc.GetAllocationKey()),
+					zap.Error(decErr))
+			}
+			targetNode.RemoveAllocation(alloc.GetAllocationKey())
+			log.Log(log.SchedPartition).Warn("failed to mark ask allocated while applying annealing result",
+				zap.String("appID", appID),
+				zap.String("allocationKey", alloc.GetAllocationKey()),
+				zap.Error(err))
+			return nil
+		}
+		app.AddAllocation(alloc)
 	}
 
 	// reservations were cancelled during the processing
@@ -1025,7 +1192,9 @@ func (pc *PartitionContext) Allocate(result *objects.AllocationResult) *objects.
 	alloc.SetInstanceType(targetNode.GetInstanceType())
 
 	// track the number of allocations
-	pc.updateAllocationCount(1)
+	if result.ResultType != objects.Replaced {
+		pc.updateAllocationCount(1)
+	}
 	if result.Request.IsPlaceholder() {
 		pc.incPhAllocationCount()
 	}
@@ -1036,6 +1205,9 @@ func (pc *PartitionContext) Allocate(result *objects.AllocationResult) *objects.
 		zap.Stringer("allocatedResource", result.Request.GetAllocatedResource()),
 		zap.Bool("placeholder", result.Request.IsPlaceholder()),
 		zap.String("targetNode", targetNodeID))
+	if pc.Strategy == "annealing" {
+		result.Request.SendScheduledEvent(targetNodeID, pc.Strategy)
+	}
 	// pass the allocation result back to the RM via the cluster context
 	return result
 }
@@ -1499,6 +1671,7 @@ func (pc *PartitionContext) removeAllocation(release *si.AllocationRelease) ([]*
 	// temp store for allocations manipulated
 	released := pc.generateReleased(release, app)
 	var confirmed *objects.Allocation
+	confirmedCount := 0
 
 	// all releases are collected: placeholder count needs updating for all placeholder releases
 	// regardless of what happens later
@@ -1587,7 +1760,14 @@ func (pc *PartitionContext) removeAllocation(release *si.AllocationRelease) ([]*
 	// if confirmed is set we can assume there will just be one alloc in the released
 	// that allocation was already released by the shim, so clean up released
 	if confirmed != nil {
+		confirmedCount = 1
 		released = nil
+		// placeholder removed and real allocation confirmed: net change equals confirmed minus placeholders
+		if phReleases > 0 {
+			pc.updateAllocationCount(confirmedCount - phReleases)
+		} else {
+			pc.updateAllocationCount(confirmedCount)
+		}
 	}
 	// track the number of allocations, when we replace the result is no change
 	if allocReleases := len(released); allocReleases > 0 {

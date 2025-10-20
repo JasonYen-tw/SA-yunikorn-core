@@ -24,9 +24,6 @@ import (
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
-
-	"github.com/apache/yunikorn-core/pkg/log"
 )
 
 const (
@@ -240,9 +237,7 @@ func initRuntimeMetrics() *RuntimeMetrics {
 	}
 
 	for _, metric := range metricsList {
-		if err := prometheus.Register(metric); err != nil {
-			log.Log(log.Metrics).Warn("failed to register metrics collector", zap.Error(err))
-		}
+		registerCollector(metric)
 	}
 
 	return rtm

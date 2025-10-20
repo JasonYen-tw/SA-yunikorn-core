@@ -187,13 +187,18 @@ func TestSAScore_With_Penalty(t *testing.T) {
 	sa := strategy.NewSimulatedAnnealingScheduler(configs.AnnealingParams{Weights: []float64{1.0, 0.5, 10.0}})
 	nodes := []*objects.Node{newTestNode("node-1", 10, 100)}
 
+	// 預先在節點上放入現有負載，模擬實際叢集狀態
+	existing := newTestAsk("existing", "app-existing", 6, 60)
+	existing.SetNodeID(nodes[0].NodeID)
+	nodes[0].AddAllocation(existing)
+
 	// Case 1: 合法的解，沒有懲罰
-	askFit := newTestAsk("ask-fit", "app-1", 5, 50)
+	askFit := newTestAsk("ask-fit", "app-1", 2, 20)
 	solFit := strategy.Solution{Assign: map[*objects.Allocation]*objects.Node{askFit: nodes[0]}}
 	scoreFit := sa.Score(solFit, nodes)
 
 	// Case 2: 不合法的解（超分），應該有懲罰
-	askOver := newTestAsk("ask-over", "app-1", 15, 150) // 資源需求超過節點容量
+	askOver := newTestAsk("ask-over", "app-1", 5, 50) // 資源需求超過節點剩餘容量
 	solOver := strategy.Solution{Assign: map[*objects.Allocation]*objects.Node{askOver: nodes[0]}}
 	scoreOver := sa.Score(solOver, nodes)
 

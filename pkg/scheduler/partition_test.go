@@ -121,6 +121,104 @@ func TestNewPartition(t *testing.T) {
 	}
 }
 
+func TestPopSAResultReturnsNilWhenIdle(t *testing.T) {
+	conf := configs.PartitionConfig{
+		Name: "test",
+		Queues: []configs.QueueConfig{
+			{
+				Name:      "root",
+				Parent:    true,
+				SubmitACL: "*",
+				Queues: []configs.QueueConfig{
+					{
+						Name:   "default",
+						Parent: false,
+					},
+				},
+			},
+		},
+		Strategy: "annealing",
+		AnnealingParams: configs.AnnealingParams{
+			InitTemp:   1,
+			CoolRate:   0.5,
+			Iterations: 1,
+			Weights:    []float64{1},
+		},
+	}
+	pc, err := newPartitionContext(conf, rmID, nil)
+	assert.NilError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		assert.Assert(t, pc.PopSAResult() == nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("PopSAResult blocked without pending work")
+	}
+}
+
+func TestAllocateMaterialisesAnnealingSuggestion(t *testing.T) {
+	setupUGM()
+	conf := configs.PartitionConfig{
+		Name: "test",
+		Queues: []configs.QueueConfig{
+			{
+				Name:      "root",
+				Parent:    true,
+				SubmitACL: "*",
+				Queues: []configs.QueueConfig{
+					{
+						Name:   "default",
+						Parent: false,
+					},
+				},
+			},
+		},
+		Strategy: "annealing",
+		AnnealingParams: configs.AnnealingParams{
+			InitTemp:   1,
+			CoolRate:   0.5,
+			Iterations: 1,
+			Weights:    []float64{1},
+		},
+	}
+	partition, err := newPartitionContext(conf, rmID, nil)
+	assert.NilError(t, err)
+
+	nodeRes := resources.NewResourceFromMap(map[string]resources.Quantity{"memory": 1000, "vcore": 10})
+	err = partition.AddNode(newNodeMaxResource(nodeID1, nodeRes))
+	assert.NilError(t, err)
+	node := partition.GetNode(nodeID1)
+	assert.Assert(t, node != nil)
+
+	app := newApplication(appID1, "test", defQueue)
+	err = partition.AddApplication(app)
+	assert.NilError(t, err)
+
+	askRes := resources.NewResourceFromMap(map[string]resources.Quantity{"memory": 100, "vcore": 1})
+	ask := newAllocationAsk("alloc-sa", appID1, askRes)
+	err = app.AddAllocationAsk(ask)
+	assert.NilError(t, err)
+	assert.Assert(t, !ask.IsAllocated())
+
+	result := &objects.AllocationResult{
+		ResultType: objects.Allocated,
+		Request:    ask,
+		NodeID:     nodeID1,
+	}
+	final := partition.Allocate(result)
+	assert.Assert(t, final != nil)
+	assert.Equal(t, objects.Allocated, final.ResultType)
+	assert.Assert(t, ask.IsAllocated(), "ask should be marked allocated after annealing result is applied")
+	assert.Assert(t, node.GetAllocation(ask.GetAllocationKey()) != nil, "node must track new allocation")
+	assert.Assert(t, resources.IsZero(app.GetPendingResource()), "pending resource should be cleared once allocation materialises")
+	assert.Assert(t, resources.Equals(app.GetQueue().GetAllocatedResource(), askRes), "queue allocation totals should reflect annealing decision")
+}
+
 func TestNewWithPlacement(t *testing.T) {
 	confWith := configs.PartitionConfig{
 		Name: "test",

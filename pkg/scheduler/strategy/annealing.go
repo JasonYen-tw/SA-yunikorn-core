@@ -1,13 +1,15 @@
 package strategy
 
 import (
-	"fmt"
 	"math"
 	"math/rand"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/apache/yunikorn-core/pkg/common/configs"
 	"github.com/apache/yunikorn-core/pkg/common/resources"
+	"github.com/apache/yunikorn-core/pkg/log"
 	"github.com/apache/yunikorn-core/pkg/metrics"
 	"github.com/apache/yunikorn-core/pkg/scheduler/objects"
 )
@@ -104,9 +106,10 @@ func canFit(ask *objects.Allocation, node *objects.Node) bool {
 	if requiredNode := ask.GetRequiredNode(); requiredNode != "" && requiredNode != node.NodeID {
 		return false
 	}
-	// 僅檢查請求資源是否小於節點總容量
-	// 注意：這裡不考慮節點已分配的資源，因為這會在 Score 函數中作為一個整體進行評估
-	return node.GetCapacity().FitIn(ask.GetAllocatedResource())
+	// 考慮節點當前已分配的資源，确保新增請求仍能放進剩餘容量
+	currentUsage := node.GetAllocatedResource()
+	expectedUsage := resources.Add(currentUsage, ask.GetAllocatedResource())
+	return node.GetCapacity().FitIn(expectedUsage)
 }
 
 // 取得所有可用asks與nodes (如果 PartitionView 介面有 RLock/RUnlock)
@@ -299,62 +302,84 @@ func (sa *SimulatedAnnealingScheduler) Score(sol Solution, allNodes []*objects.N
 		return 0
 	}
 
-	// ── 1. 聚集各節點的預計使用資源 ────────────────────
-	nodeUsed := make(map[*objects.Node]*resources.Resource)
+	// ── 1. 聚集各節點的預計新增使用資源 ────────────────────
+	nodeDemand := make(map[*objects.Node]*resources.Resource)
 	for ask, node := range sol.Assign {
-		if nodeUsed[node] == nil {
-			nodeUsed[node] = resources.NewResource()
-		}
-		nodeUsed[node] = resources.Add(nodeUsed[node], ask.GetAllocatedResource())
+		nodeDemand[node] = resources.Add(nodeDemand[node], ask.GetAllocatedResource())
 	}
 
 	// ── 2. 計算懲罰項、使用率、標準差 ──────────────────
 	var (
 		penalty                    float64
 		totalUsedCPU, totalUsedMem float64
+		totalCapCPU, totalCapMem   float64
 		meanUtil, sumSq            float64
 		utilNodeCount              int
 	)
 
-	// 計算每個被使用節點的利用率和懲罰
-	for node, usedRes := range nodeUsed {
-		// 如果節點預計使用量超過其總容量，增加懲罰
-		if !node.GetCapacity().FitIn(usedRes) {
-			penalty += 1.0 // 可以設計更複雜的懲罰，例如超出的資源量
+	for _, node := range allNodes {
+		capacity := node.GetCapacity()
+		if capacity == nil {
+			continue
 		}
 
-		utilCPU := 0.0
-		if node.GetCapacity().GetCPU() > 0 {
-			utilCPU = float64(usedRes.GetCPU()) / float64(node.GetCapacity().GetCPU())
-		}
-		utilMem := 0.0
-		if node.GetCapacity().GetMemory() > 0 {
-			utilMem = float64(usedRes.GetMemory()) / float64(node.GetCapacity().GetMemory())
+		demand := nodeDemand[node]
+		currentUsage := node.GetAllocatedResource()
+		combinedUsage := resources.Add(currentUsage, demand)
+
+		// 如果節點總使用量超過其總容量，計算懲罰
+		if !capacity.FitIn(combinedUsage) {
+			excess := resources.Sub(combinedUsage, capacity)
+			for name, qty := range excess.Resources {
+				if qty <= 0 {
+					continue
+				}
+				capQty := capacity.Resources[name]
+				if capQty > 0 {
+					penalty += float64(qty) / float64(capQty)
+				} else {
+					penalty += float64(qty)
+				}
+			}
 		}
 
-		avgUtil := (utilCPU + utilMem) / 2.0
-		meanUtil += avgUtil
-		sumSq += avgUtil * avgUtil
-		utilNodeCount++
+		usedCPU := float64(combinedUsage.GetCPU())
+		usedMem := float64(combinedUsage.GetMemory())
+		capCPU := float64(capacity.GetCPU())
+		capMem := float64(capacity.GetMemory())
 
-		totalUsedCPU += float64(usedRes.GetCPU())
-		totalUsedMem += float64(usedRes.GetMemory())
+		if capCPU > 0 || capMem > 0 {
+			utilNodeCount++
+			utilCPU := 0.0
+			if capCPU > 0 {
+				utilCPU = usedCPU / capCPU
+			}
+			utilMem := 0.0
+			if capMem > 0 {
+				utilMem = usedMem / capMem
+			}
+			avgUtil := (utilCPU + utilMem) / 2.0
+			meanUtil += avgUtil
+			sumSq += avgUtil * avgUtil
+		}
+
+		totalUsedCPU += usedCPU
+		totalUsedMem += usedMem
+		totalCapCPU += capCPU
+		totalCapMem += capMem
 	}
 
 	if utilNodeCount == 0 {
-		return -10.0 * penalty // 如果沒有分配，只有懲罰
-	}
-
-	// ── 3. 計算整個集群的總容量和總利用率 ──────────────
-	var totalCapCPU, totalCapMem float64
-	for _, node := range allNodes {
-		totalCapCPU += float64(node.GetCapacity().GetCPU())
-		totalCapMem += float64(node.GetCapacity().GetMemory())
+		return -10.0 * penalty
 	}
 
 	// 計算標準差和集群利用率
 	meanUtil /= float64(utilNodeCount)
-	stdDev := math.Sqrt(sumSq/float64(utilNodeCount) - meanUtil*meanUtil)
+	variance := sumSq/float64(utilNodeCount) - meanUtil*meanUtil
+	if variance < 0 {
+		variance = 0
+	}
+	stdDev := math.Sqrt(variance)
 
 	clusterUtil := 0.0
 	if totalCapCPU+totalCapMem > 0 {
@@ -456,13 +481,23 @@ func (sa *SimulatedAnnealingScheduler) Score(sol Solution, allNodes []*objects.N
 
 // === 主 SA 行為 ===
 func (sa *SimulatedAnnealingScheduler) Schedule(p PartitionView) []*objects.AllocationResult {
-	fmt.Println("[DEBUG] SimulatedAnnealingScheduler.Schedule called")
+	partitionName := p.GetName()
 	start := time.Now()
 
 	// 步驟 1: 獲取當前調度週期的 asks 和 nodes 快照
 	asks, nodes := sa.getAsksAndNodes(p)
+	log.Log(log.Scheduler).Info("annealing initialization",
+		zap.String("partition", partitionName),
+		zap.Int("pendingAsks", len(asks)),
+		zap.Int("availableNodes", len(nodes)),
+		zap.Float64("initTemp", sa.InitTemp),
+		zap.Float64("coolRate", sa.CoolRate),
+		zap.Int("iterationsPerStep", sa.Iterations))
 	if len(asks) == 0 || len(nodes) == 0 {
-		fmt.Println("[DEBUG] No asks or nodes to schedule")
+		log.Log(log.Scheduler).Debug("annealing skipped - insufficient workload",
+			zap.String("partition", partitionName),
+			zap.Int("pendingAsks", len(asks)),
+			zap.Int("availableNodes", len(nodes)))
 		return nil
 	}
 
@@ -472,8 +507,13 @@ func (sa *SimulatedAnnealingScheduler) Schedule(p PartitionView) []*objects.Allo
 	curr.Score = sa.Score(curr, nodes)
 	best := curr
 	T := sa.InitTemp
+	temperatureStep := 0
 
 	for T > 0.1 {
+		log.Log(log.Scheduler).Debug("annealing temperature iteration",
+			zap.String("partition", partitionName),
+			zap.Float64("temperature", T),
+			zap.Int("step", temperatureStep))
 		for i := 0; i < sa.Iterations; i++ {
 			neighbor := sa.RandomNeighbor(curr, nodes)
 			// [FIXED] 傳入 allNodes
@@ -483,10 +523,17 @@ func (sa *SimulatedAnnealingScheduler) Schedule(p PartitionView) []*objects.Allo
 				curr = neighbor
 				if curr.Score > best.Score {
 					best = curr
+					log.Log(log.Scheduler).Debug("annealing best candidate updated",
+						zap.String("partition", partitionName),
+						zap.Float64("score", best.Score),
+						zap.Int("assignments", len(best.Assign)),
+						zap.Int("innerIteration", i),
+						zap.Int("temperatureStep", temperatureStep))
 				}
 			}
 		}
 		T *= sa.CoolRate
+		temperatureStep++
 	}
 
 	// 步驟 3: [FIXED] 將最佳解打包成 AllocationResult，作為「建議」返回
@@ -499,9 +546,19 @@ func (sa *SimulatedAnnealingScheduler) Schedule(p PartitionView) []*objects.Allo
 			NodeID:     node.NodeID,
 		})
 	}
-	fmt.Printf("[DEBUG] SA produced %d allocation candidates\n", len(results))
 
-	metrics.GetSchedulerMetrics().ObserveSA(p.GetName(), time.Since(start), best.Score)
+	duration := time.Since(start)
+	log.Log(log.Scheduler).Info("annealing search complete",
+		zap.String("partition", partitionName),
+		zap.Duration("duration", duration),
+		zap.Float64("bestScore", best.Score),
+		zap.Int("candidates", len(results)))
+	metrics.GetSchedulerMetrics().ObserveSA(partitionName, duration, best.Score)
+	if len(results) > 0 {
+		log.Log(log.Scheduler).Info("annealing allocation candidates ready",
+			zap.String("partition", partitionName),
+			zap.Int("candidates", len(results)))
+	}
 
 	return results
 }

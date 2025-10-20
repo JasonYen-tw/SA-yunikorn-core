@@ -23,6 +23,8 @@ type PartitionInfo struct {
 	Name                    string            `json:"name"`              // no omitempty, name should not be empty
 	Capacity                PartitionCapacity `json:"capacity"`          // no omitempty, omitempty doesn't work on a structure value
 	NodeSortingPolicy       NodeSortingPolicy `json:"nodeSortingPolicy"` // no omitempty, omitempty doesn't work on a structure value
+	Strategy                string            `json:"strategy,omitempty"`
+	StrategyStatus          *StrategyStatus   `json:"strategyStatus,omitempty"`
 	TotalNodes              int               `json:"totalNodes,omitempty"`
 	Applications            map[string]int    `json:"applications,omitempty"`
 	TotalContainers         int               `json:"totalContainers,omitempty"`
@@ -39,4 +41,11 @@ type PartitionCapacity struct {
 type NodeSortingPolicy struct {
 	Type            string             `json:"type,omitempty"`
 	ResourceWeights map[string]float64 `json:"resourceWeights,omitempty"`
+}
+
+type StrategyStatus struct {
+	Running          bool  `json:"running"`
+	PendingDecisions int   `json:"pendingDecisions,omitempty"`
+	LastRunCandidates int  `json:"lastRunCandidates,omitempty"`
+	LastRunTimestamp int64 `json:"lastRunTimestamp,omitempty"`
 }

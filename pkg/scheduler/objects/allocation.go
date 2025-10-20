@@ -458,6 +458,13 @@ func (a *Allocation) SendRequiredNodePreemptionFailedEvent(node string) {
 	a.askEvents.SendRequiredNodePreemptionFailed(a.allocationKey, a.applicationID, node, a.GetAllocatedResource())
 }
 
+func (a *Allocation) SendScheduledEvent(nodeID, strategy string) {
+	if a == nil || a.askEvents == nil {
+		return
+	}
+	a.askEvents.SendAllocationScheduled(a.allocationKey, a.applicationID, nodeID, strategy, a.GetAllocatedResource())
+}
+
 // GetAllocationLog returns a list of log entries corresponding to allocation preconditions not being met.
 func (a *Allocation) GetAllocationLog() []*AllocationLogEntry {
 	a.RLock()

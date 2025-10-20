@@ -966,6 +966,23 @@ func getPartitionInfoDAO(lists map[string]*scheduler.PartitionContext) []*dao.Pa
 		partitionInfo.State = partitionContext.GetCurrentState()
 		partitionInfo.LastStateTransitionTime = partitionContext.GetStateTime().UnixNano()
 
+		strategyName := partitionContext.GetStrategy()
+		if strategyName != "" {
+			partitionInfo.Strategy = strategyName
+			running, pending, lastCount, lastRun := partitionContext.GetStrategyStatus()
+			status := &dao.StrategyStatus{Running: running}
+			if pending > 0 {
+				status.PendingDecisions = pending
+			}
+			if lastCount > 0 {
+				status.LastRunCandidates = lastCount
+			}
+			if !lastRun.IsZero() {
+				status.LastRunTimestamp = lastRun.UnixNano()
+			}
+			partitionInfo.StrategyStatus = status
+		}
+
 		capacityInfo := dao.PartitionCapacity{}
 		capacity := partitionContext.GetTotalPartitionResource()
 		usedCapacity := partitionContext.GetAllocatedResource()
