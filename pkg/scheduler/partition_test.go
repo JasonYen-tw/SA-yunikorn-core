@@ -21,6 +21,7 @@ package scheduler
 import (
 	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	"github.com/apache/yunikorn-core/pkg/rmproxy/rmevent"
 	"github.com/apache/yunikorn-core/pkg/scheduler/objects"
 	"github.com/apache/yunikorn-core/pkg/scheduler/policies"
+	"github.com/apache/yunikorn-core/pkg/scheduler/strategy"
 	"github.com/apache/yunikorn-core/pkg/scheduler/ugm"
 	siCommon "github.com/apache/yunikorn-scheduler-interface/lib/go/common"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
@@ -161,6 +163,67 @@ func TestPopSAResultReturnsNilWhenIdle(t *testing.T) {
 	}
 }
 
+type blockingSAStrategy struct {
+	started   chan struct{}
+	release   chan struct{}
+	results   []*objects.AllocationResult
+	startOnce sync.Once
+}
+
+func (b *blockingSAStrategy) Schedule(p strategy.PartitionView) []*objects.AllocationResult {
+	b.startOnce.Do(func() { close(b.started) })
+	<-b.release
+	return b.results
+}
+
+type sequentialSAStrategy struct {
+	mu        sync.Mutex
+	results   [][]*objects.AllocationResult
+	callCount int
+}
+
+func (s *sequentialSAStrategy) Schedule(p strategy.PartitionView) []*objects.AllocationResult {
+	s.mu.Lock()
+	idx := s.callCount
+	s.callCount++
+	s.mu.Unlock()
+	if idx < len(s.results) {
+		return s.results[idx]
+	}
+	return nil
+}
+
+func (s *sequentialSAStrategy) CallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.callCount
+}
+
+func waitForSAResult(t *testing.T, pc *PartitionContext, timeout time.Duration) *objects.AllocationResult {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if res := pc.PopSAResult(); res != nil {
+			return res
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for SA result")
+	return nil
+}
+
+func waitForCallCount(t *testing.T, strat *sequentialSAStrategy, expected int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strat.CallCount() >= expected {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d SA invocations (have %d)", expected, strat.CallCount())
+}
+
 func TestAllocateMaterialisesAnnealingSuggestion(t *testing.T) {
 	setupUGM()
 	conf := configs.PartitionConfig{
@@ -217,6 +280,161 @@ func TestAllocateMaterialisesAnnealingSuggestion(t *testing.T) {
 	assert.Assert(t, node.GetAllocation(ask.GetAllocationKey()) != nil, "node must track new allocation")
 	assert.Assert(t, resources.IsZero(app.GetPendingResource()), "pending resource should be cleared once allocation materialises")
 	assert.Assert(t, resources.Equals(app.GetQueue().GetAllocatedResource(), askRes), "queue allocation totals should reflect annealing decision")
+}
+
+func TestPopSAResultNonBlockingWhileSAComputes(t *testing.T) {
+	setupUGM()
+	conf := configs.PartitionConfig{
+		Name: "test",
+		Queues: []configs.QueueConfig{
+			{
+				Name:      "root",
+				Parent:    true,
+				SubmitACL: "*",
+				Queues: []configs.QueueConfig{
+					{
+						Name:   "default",
+						Parent: false,
+					},
+				},
+			},
+		},
+		Strategy: "annealing",
+		AnnealingParams: configs.AnnealingParams{
+			InitTemp:   1,
+			CoolRate:   0.5,
+			Iterations: 1,
+			Weights:    []float64{1},
+		},
+	}
+	pc, err := newPartitionContext(conf, rmID, nil)
+	assert.NilError(t, err)
+
+	nodeRes := resources.NewResourceFromMap(map[string]resources.Quantity{"memory": 1000, "vcore": 10})
+	err = pc.AddNode(newNodeMaxResource(nodeID1, nodeRes))
+	assert.NilError(t, err)
+
+	app := newApplication(appID1, "test", defQueue)
+	err = pc.AddApplication(app)
+	assert.NilError(t, err)
+
+	askRes := resources.NewResourceFromMap(map[string]resources.Quantity{"memory": 100, "vcore": 1})
+	ask := newAllocationAsk("alloc-sa", appID1, askRes)
+	err = app.AddAllocationAsk(ask)
+	assert.NilError(t, err)
+
+	blocking := &blockingSAStrategy{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		results: []*objects.AllocationResult{
+			{
+				ResultType: objects.Allocated,
+				Request:    ask,
+				NodeID:     nodeID1,
+			},
+		},
+	}
+	pc.SAInstance = blocking
+
+	done := make(chan struct{})
+	go func() {
+		assert.Assert(t, pc.PopSAResult() == nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("PopSAResult blocked while SA strategy was running")
+	}
+
+	select {
+	case <-blocking.started:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("SA strategy was not started when pending work existed")
+	}
+
+	close(blocking.release)
+	res := waitForSAResult(t, pc, time.Second)
+	assert.Assert(t, res != nil)
+	assert.Equal(t, "alloc-sa", res.Request.GetAllocationKey())
+}
+
+func TestPopSAResultStartsNextRunWhenPendingRemains(t *testing.T) {
+	setupUGM()
+	conf := configs.PartitionConfig{
+		Name: "test",
+		Queues: []configs.QueueConfig{
+			{
+				Name:      "root",
+				Parent:    true,
+				SubmitACL: "*",
+				Queues: []configs.QueueConfig{
+					{
+						Name:   "default",
+						Parent: false,
+					},
+				},
+			},
+		},
+		Strategy: "annealing",
+		AnnealingParams: configs.AnnealingParams{
+			InitTemp:   1,
+			CoolRate:   0.5,
+			Iterations: 1,
+			Weights:    []float64{1},
+		},
+	}
+	pc, err := newPartitionContext(conf, rmID, nil)
+	assert.NilError(t, err)
+
+	nodeRes := resources.NewResourceFromMap(map[string]resources.Quantity{"memory": 1000, "vcore": 10})
+	err = pc.AddNode(newNodeMaxResource(nodeID1, nodeRes))
+	assert.NilError(t, err)
+
+	app := newApplication(appID1, "test", defQueue)
+	err = pc.AddApplication(app)
+	assert.NilError(t, err)
+
+	askRes := resources.NewResourceFromMap(map[string]resources.Quantity{"memory": 100, "vcore": 1})
+	ask1 := newAllocationAsk("alloc-sa-1", appID1, askRes)
+	ask2 := newAllocationAsk("alloc-sa-2", appID1, askRes)
+	assert.NilError(t, app.AddAllocationAsk(ask1))
+	assert.NilError(t, app.AddAllocationAsk(ask2))
+
+	seq := &sequentialSAStrategy{
+		results: [][]*objects.AllocationResult{
+			{
+				{
+					ResultType: objects.Allocated,
+					Request:    ask1,
+					NodeID:     nodeID1,
+				},
+			},
+			{
+				{
+					ResultType: objects.Allocated,
+					Request:    ask2,
+					NodeID:     nodeID1,
+				},
+			},
+		},
+	}
+	pc.SAInstance = seq
+
+	res1 := waitForSAResult(t, pc, time.Second)
+	assert.Assert(t, res1 != nil)
+	assert.Equal(t, "alloc-sa-1", res1.Request.GetAllocationKey())
+	waitForCallCount(t, seq, 1, time.Second)
+
+	final := pc.Allocate(res1)
+	assert.Assert(t, final != nil)
+
+	waitForCallCount(t, seq, 2, time.Second)
+
+	res2 := waitForSAResult(t, pc, time.Second)
+	assert.Assert(t, res2 != nil)
+	assert.Equal(t, "alloc-sa-2", res2.Request.GetAllocationKey())
 }
 
 func TestNewWithPlacement(t *testing.T) {

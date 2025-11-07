@@ -134,16 +134,17 @@ func (cc *ClusterContext) Schedule() bool {
 		// [FIXED] 統一處理所有調度來源的結果
 		var result *objects.AllocationResult
 		schedulingStart := time.Now()
-
-		// 步驟 1: 優先嘗試從 SA 緩衝區獲取「建議」
-		if psc.Strategy == "annealing" {
-			if saRes := psc.PopSAResult(); saRes != nil {
-				result = psc.executeAllocation(saRes, "annealing")
-			}
+		partitionStart := schedulingStart
+		strategyLabel := psc.Strategy
+		if strategyLabel != metrics.StrategyAnnealing {
+			strategyLabel = metrics.StrategyNative
 		}
 
-		// 步驟 2: 如果 SA 沒有結果，或者不是 SA 策略，則執行原生調度邏輯
-		if result == nil {
+		if psc.Strategy == "annealing" {
+			if saRes := psc.PopSAResult(); saRes != nil {
+				result = psc.executeAllocation(saRes, metrics.StrategyAnnealing)
+			}
+		} else {
 			// try reservations first
 			result = psc.tryReservedAllocate()
 			if result == nil {
@@ -165,6 +166,7 @@ func (cc *ClusterContext) Schedule() bool {
 				allocationSummary[psc.Name][result.NodeID]++
 			}
 			// 只有在這裡，當 `result` 非空時，才意味著一次成功的、經過驗證的分配發生了
+			metrics.GetSchedulerMetrics().ObserveSchedulingLatencyByStrategy(psc.Name, strategyLabel, schedulingStart)
 			metrics.GetSchedulerMetrics().ObserveSchedulingLatency(schedulingStart)
 			if result.ResultType == objects.Replaced {
 				// communicate the removal to the RM
@@ -174,7 +176,18 @@ func (cc *ClusterContext) Schedule() bool {
 				cc.notifyRMNewAllocation(psc.RmID, result.Request)
 			}
 			activity = true
+			metrics.GetSchedulerMetrics().ObserveAllocationThroughput(psc.Name, strategyLabel, true)
+		} else {
+			metrics.GetSchedulerMetrics().ObserveAllocationThroughput(psc.Name, strategyLabel, false)
 		}
+
+		loopDuration := time.Since(partitionStart)
+		state := metrics.MainLoopStateIdle
+		if result != nil {
+			state = metrics.MainLoopStateExecute
+		}
+		metrics.GetSchedulerMetrics().AddMainLoopDuration(psc.Name, state, loopDuration)
+		metrics.GetSchedulerMetrics().SetPendingAskCount(psc.Name, psc.CountPendingAsks())
 	}
 	if len(allocationSummary) > 0 {
 		log.Log(log.Scheduler).Info("allocation summary for scheduling cycle",

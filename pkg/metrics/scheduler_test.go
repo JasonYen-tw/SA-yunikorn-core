@@ -168,6 +168,80 @@ func TestSchedulerApplicationsFailed(t *testing.T) {
 	verifyMetric(t, 1, "failed", "yunikorn_scheduler_application_total", dto.MetricType_GAUGE, "state")
 }
 
+func TestAllocationThroughputMetric(t *testing.T) {
+	sm = getSchedulerMetrics(t)
+	defer unregisterMetrics()
+
+	sm.ObserveAllocationThroughput("p1", StrategyAnnealing, true)
+	sm.ObserveAllocationThroughput("p1", StrategyAnnealing, false)
+
+	verifyMetricWithLabels(t, 1, "yunikorn_scheduler_allocation_total", dto.MetricType_COUNTER, map[string]string{
+		"partition": "p1",
+		"strategy":  StrategyAnnealing,
+		"outcome":   OutcomeSuccess,
+	})
+	verifyMetricWithLabels(t, 1, "yunikorn_scheduler_allocation_total", dto.MetricType_COUNTER, map[string]string{
+		"partition": "p1",
+		"strategy":  StrategyAnnealing,
+		"outcome":   OutcomeFailure,
+	})
+}
+
+func TestPendingAskGauge(t *testing.T) {
+	sm = getSchedulerMetrics(t)
+	defer unregisterMetrics()
+
+	sm.SetPendingAskCount("p1", 42)
+	verifyMetricWithLabels(t, 42, "yunikorn_scheduler_pending_asks", dto.MetricType_GAUGE, map[string]string{
+		"partition": "p1",
+	})
+}
+
+func TestSASuggestionMetrics(t *testing.T) {
+	sm = getSchedulerMetrics(t)
+	defer unregisterMetrics()
+
+	sm.RecordSASuggestionAttempt("p1")
+	sm.RecordSASuggestionResult("p1", true)
+	sm.RecordSASuggestionResult("p1", false)
+
+	verifyMetricWithLabels(t, 1, "yunikorn_scheduler_sa_suggestion_total", dto.MetricType_COUNTER, map[string]string{
+		"partition": "p1",
+		"outcome":   SAOutcomeAttempt,
+	})
+	verifyMetricWithLabels(t, 1, "yunikorn_scheduler_sa_suggestion_total", dto.MetricType_COUNTER, map[string]string{
+		"partition": "p1",
+		"outcome":   SAOutcomeAdopted,
+	})
+	verifyMetricWithLabels(t, 1, "yunikorn_scheduler_sa_suggestion_total", dto.MetricType_COUNTER, map[string]string{
+		"partition": "p1",
+		"outcome":   SAOutcomeRejected,
+	})
+}
+
+func TestSchedulingLatencyByStrategy(t *testing.T) {
+	sm = getSchedulerMetrics(t)
+	defer unregisterMetrics()
+
+	start := time.Now().Add(-2 * time.Second)
+	sm.ObserveSchedulingLatencyByStrategy("p1", StrategyAnnealing, start)
+	verifyHistogramWithLabels(t, "yunikorn_scheduler_scheduling_latency_seconds", map[string]string{
+		"partition": "p1",
+		"strategy":  StrategyAnnealing,
+	}, 2, 1)
+}
+
+func TestMainLoopDurationMetric(t *testing.T) {
+	sm = getSchedulerMetrics(t)
+	defer unregisterMetrics()
+
+	sm.AddMainLoopDuration("p1", MainLoopStateExecute, 1500*time.Millisecond)
+	verifyMetricWithLabels(t, 1.5, "yunikorn_scheduler_mainloop_state_seconds_total", dto.MetricType_COUNTER, map[string]string{
+		"partition": "p1",
+		"state":     MainLoopStateExecute,
+	})
+}
+
 func getSchedulerMetrics(t *testing.T) *SchedulerMetrics {
 	unregisterMetrics()
 	return InitSchedulerMetrics()
@@ -216,14 +290,80 @@ func verifyMetric(t *testing.T, expectedCounter float64, expectedState string, n
 	assert.Assert(t, checked, "Failed to find metric")
 }
 
+func verifyMetricWithLabels(t *testing.T, expected float64, name string, metricType dto.MetricType, labels map[string]string) {
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	assert.NilError(t, err)
+	for _, metric := range mfs {
+		if metric.GetName() != name {
+			continue
+		}
+		for _, m := range metric.Metric {
+			if matchLabels(m.Label, labels) {
+				switch metricType {
+				case dto.MetricType_COUNTER:
+					assert.Equal(t, expected, m.Counter.GetValue())
+				case dto.MetricType_GAUGE:
+					assert.Equal(t, expected, m.Gauge.GetValue())
+				default:
+					assert.Assert(t, false, "unsupported metric type")
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("metric %s with labels %v not found", name, labels)
+}
+
+func matchLabels(actual []*dto.LabelPair, expected map[string]string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for _, lp := range actual {
+		if val, ok := expected[lp.GetName()]; !ok || val != lp.GetValue() {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyHistogramWithLabels(t *testing.T, name string, labels map[string]string, expected float64, delta float64) {
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	assert.NilError(t, err)
+	for _, metric := range mfs {
+		if metric.GetName() != name {
+			continue
+		}
+		for _, m := range metric.Metric {
+			if matchLabels(m.Label, labels) {
+				realDelta := math.Abs(m.Histogram.GetSampleSum() - expected)
+				assert.Check(t, realDelta < delta, fmt.Sprintf("wrong delta, expected <= %f, was %f", delta, realDelta))
+				return
+			}
+		}
+	}
+	t.Fatalf("histogram %s with labels %v not found", name, labels)
+}
+
 func unregisterMetrics() {
 	sm := GetSchedulerMetrics()
 	prometheus.Unregister(sm.containerAllocation)
+	prometheus.Unregister(sm.allocationThroughput)
 	prometheus.Unregister(sm.applicationSubmission)
 	prometheus.Unregister(sm.application)
 	prometheus.Unregister(sm.node)
 	prometheus.Unregister(sm.schedulingLatency)
+	prometheus.Unregister(sm.schedulingLatencyByStrategy)
 	prometheus.Unregister(sm.sortingLatency)
 	prometheus.Unregister(sm.tryNodeLatency)
 	prometheus.Unregister(sm.tryPreemptionLatency)
+	prometheus.Unregister(sm.saIterations)
+	prometheus.Unregister(sm.saLatency)
+	prometheus.Unregister(sm.saBestCost)
+	prometheus.Unregister(sm.saFailures)
+	prometheus.Unregister(sm.saRunning)
+	prometheus.Unregister(sm.saPendingDecisions)
+	prometheus.Unregister(sm.saLastResultSize)
+	prometheus.Unregister(sm.saSuggestionOutcome)
+	prometheus.Unregister(sm.pendingAsks)
+	prometheus.Unregister(sm.mainLoopTime)
 }

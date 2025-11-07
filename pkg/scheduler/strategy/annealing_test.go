@@ -1,6 +1,7 @@
 package strategy_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -171,16 +172,45 @@ func Test_SA_Schedule_Returns_Valid_Allocation_Candidates(t *testing.T) {
 
 func TestSAInitialization(t *testing.T) {
 	params := configs.AnnealingParams{
-		InitTemp:   10.0,
-		CoolRate:   0.95,
-		Iterations: 100,
-		Weights:    []float64{1.0, 0.5, 10.0},
+		InitTemp:       10.0,
+		CoolRate:       0.95,
+		Iterations:     100,
+		Weights:        []float64{1.0, 0.5, 10.0},
+		MaxPendingAsks: 42,
 	}
 	sa := strategy.NewSimulatedAnnealingScheduler(params)
 	assert.Equal(t, 10.0, sa.InitTemp)
 	assert.Equal(t, 0.95, sa.CoolRate)
 	assert.Equal(t, 100, sa.Iterations)
 	assert.Equal(t, 3, len(sa.Weights))
+	assert.Equal(t, 42, sa.MaxPendingAsks)
+}
+
+func TestSARespectsMaxPendingAsks(t *testing.T) {
+	node := newTestNode("node-max", 100, 10000)
+	app := newApplication(t, "app-max", "mock_partition", "root.default")
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("ask-%d", i)
+		ask := newTestAsk(key, "app-max", 1, 10)
+		_ = app.AddAllocationAsk(ask)
+	}
+
+	mockPartition := &MockPartitionView{
+		apps:  []*objects.Application{app},
+		nodes: []*objects.Node{node},
+	}
+
+	limit := 2
+	sa := strategy.NewSimulatedAnnealingScheduler(configs.AnnealingParams{
+		InitTemp:       10,
+		CoolRate:       0.9,
+		Iterations:     20,
+		Weights:        []float64{1, 1, 1},
+		MaxPendingAsks: limit,
+	})
+
+	results := sa.Schedule(mockPartition)
+	assert.Equal(t, limit, len(results), "annealing should process at most maxPendingAsks asks per run")
 }
 
 func TestSAScore_With_Penalty(t *testing.T) {

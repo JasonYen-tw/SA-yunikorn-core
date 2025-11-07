@@ -122,6 +122,50 @@ func (pc *PartitionContext) updateSAPendingMetricsLocked() {
 	metrics.GetSchedulerMetrics().SetSAPendingCandidates(pc.Name, pending)
 }
 
+func (pc *PartitionContext) CountPendingAsks() int {
+	pc.RLock()
+	defer pc.RUnlock()
+	total := 0
+	for _, app := range pc.applications {
+		total += len(app.GetPendingAsks())
+	}
+	return total
+}
+
+func (pc *PartitionContext) hasPendingWorkLocked() bool {
+	if pc.root == nil {
+		return false
+	}
+	return resources.StrictlyGreaterThanZero(pc.root.GetPendingResource())
+}
+
+func (pc *PartitionContext) compactSABufferLocked() {
+	if pc.saIndex == 0 || len(pc.SABuffer) == 0 {
+		return
+	}
+	if pc.saIndex >= len(pc.SABuffer) {
+		pc.SABuffer = nil
+		pc.saIndex = 0
+		return
+	}
+	remaining := len(pc.SABuffer) - pc.saIndex
+	newBuf := make([]*objects.AllocationResult, remaining)
+	copy(newBuf, pc.SABuffer[pc.saIndex:])
+	pc.SABuffer = newBuf
+	pc.saIndex = 0
+}
+
+func (pc *PartitionContext) appendSAResultsLocked(results []*objects.AllocationResult) {
+	pc.compactSABufferLocked()
+	if len(results) == 0 {
+		if len(pc.SABuffer) == 0 {
+			pc.SABuffer = nil
+		}
+		return
+	}
+	pc.SABuffer = append(pc.SABuffer, results...)
+}
+
 func (pc *PartitionContext) logPodSchedulingStage(stage, source, status string, result *objects.AllocationResult) {
 	if result == nil || result.Request == nil {
 		return
@@ -172,6 +216,10 @@ func (pc *PartitionContext) executeAllocation(result *objects.AllocationResult, 
 	if result == nil {
 		return nil
 	}
+	isSA := source == metrics.StrategyAnnealing
+	if isSA {
+		metrics.GetSchedulerMetrics().RecordSASuggestionAttempt(pc.Name)
+	}
 	pc.logPodSchedulingStage("pre", source, "pending", result)
 	final := pc.Allocate(result)
 	logResult := result
@@ -180,6 +228,10 @@ func (pc *PartitionContext) executeAllocation(result *objects.AllocationResult, 
 	}
 	status := allocationStatus(logResult, final != nil)
 	pc.logPodSchedulingStage("post", source, status, logResult)
+	success := final != nil
+	if isSA {
+		metrics.GetSchedulerMetrics().RecordSASuggestionResult(pc.Name, success)
+	}
 	return final
 }
 
@@ -200,7 +252,7 @@ func (pc *PartitionContext) LoadSAResults(results []*objects.AllocationResult) {
 
 // 已鎖版本（不再重新 Lock）
 func (pc *PartitionContext) ensureSARunningLocked() {
-	if pc.saRunning {
+	if pc.saRunning || pc.SAInstance == nil {
 		return
 	}
 	pc.saRunning = true
@@ -208,38 +260,34 @@ func (pc *PartitionContext) ensureSARunningLocked() {
 	go pc.runSAInBackground()
 }
 
-// PopSAResult：只用一把鎖，並在 Wait 前符合 cond 使用慣例
 func (pc *PartitionContext) PopSAResult() *objects.AllocationResult {
 	pc.saLock.Lock()
 	defer pc.saLock.Unlock()
 
-	for {
-		if pc.saIndex < len(pc.SABuffer) {
-			res := pc.SABuffer[pc.saIndex]
-			pc.saIndex++
-			if pc.saIndex >= len(pc.SABuffer) {
-				pc.SABuffer = nil
-			}
-			pc.updateSAPendingMetricsLocked()
-			return res
+	if pc.saIndex < len(pc.SABuffer) {
+		res := pc.SABuffer[pc.saIndex]
+		pc.saIndex++
+		if pc.saIndex >= len(pc.SABuffer) {
+			pc.SABuffer = nil
+			pc.saIndex = 0
 		}
-
-		// 沒有排隊資源且背景 SA 未執行時，直接返回避免無限等待
-		hasPending := false
-		if pc.root != nil {
-			hasPending = resources.StrictlyGreaterThanZero(pc.root.GetPendingResource())
-		}
-		if !hasPending && !pc.saRunning {
-			pc.updateSAPendingMetricsLocked()
-			return nil
-		}
-
-		if hasPending {
+		pc.updateSAPendingMetricsLocked()
+		if !pc.saRunning && pc.hasPendingWorkLocked() {
 			pc.ensureSARunningLocked()
 		}
-
-		pc.saCond.Wait() // Wait 會自動解鎖並在喚醒後重新上鎖
+		return res
 	}
+
+	if pc.saIndex >= len(pc.SABuffer) {
+		pc.SABuffer = nil
+		pc.saIndex = 0
+	}
+
+	if !pc.saRunning && pc.hasPendingWorkLocked() {
+		pc.ensureSARunningLocked()
+	}
+	pc.updateSAPendingMetricsLocked()
+	return nil
 }
 
 // 背景執行 SA
@@ -252,20 +300,20 @@ func (pc *PartitionContext) runSAInBackground() {
 		pc.saLock.Lock()
 
 		// 3. 更新共享的 buffer 和狀態
-		pc.SABuffer = results
-		pc.saIndex = 0
-		if len(results) > 0 {
+		pc.appendSAResultsLocked(results)
+		resultCount := len(results)
+		if resultCount > 0 {
 			log.Log(log.SchedPartition).Debug("annealing background run produced results",
 				zap.String("partition", pc.Name),
-				zap.Int("count", len(results)))
+				zap.Int("count", resultCount))
 		}
-		pc.lastSAResultCount = len(results)
+		pc.lastSAResultCount = resultCount
 		pc.lastSARunTime = time.Now()
-		metrics.GetSchedulerMetrics().SetSALastResultSize(pc.Name, len(results))
+		metrics.GetSchedulerMetrics().SetSALastResultSize(pc.Name, resultCount)
 		pc.updateSAPendingMetricsLocked()
 
 		// 4. 判斷是否需要繼續運行
-		keepRunning := len(results) == 0 && resources.StrictlyGreaterThanZero(pc.root.GetPendingResource())
+		keepRunning := resultCount == 0 && pc.hasPendingWorkLocked()
 		pc.saRunning = keepRunning
 		metrics.GetSchedulerMetrics().SetSARunning(pc.Name, keepRunning)
 

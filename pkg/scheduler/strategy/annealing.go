@@ -41,11 +41,12 @@ func NewOnlyNodeIterator(node *objects.Node) objects.NodeIterator {
 
 // === SA型別定義 ===
 type SimulatedAnnealingScheduler struct {
-	InitTemp   float64
-	CoolRate   float64
-	Iterations int
-	Weights    []float64
-	rand       *rand.Rand
+	InitTemp       float64
+	CoolRate       float64
+	Iterations     int
+	Weights        []float64
+	MaxPendingAsks int
+	rand           *rand.Rand
 }
 
 //	func NewSimulatedAnnealingScheduler() *SimulatedAnnealingScheduler {
@@ -60,11 +61,12 @@ type SimulatedAnnealingScheduler struct {
 
 func NewSimulatedAnnealingScheduler(param configs.AnnealingParams) *SimulatedAnnealingScheduler {
 	return &SimulatedAnnealingScheduler{
-		InitTemp:   param.InitTemp,
-		CoolRate:   param.CoolRate,
-		Iterations: param.Iterations,
-		Weights:    param.Weights,
-		rand:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		InitTemp:       param.InitTemp,
+		CoolRate:       param.CoolRate,
+		Iterations:     param.Iterations,
+		Weights:        param.Weights,
+		MaxPendingAsks: param.MaxPendingAsks,
+		rand:           rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -129,6 +131,14 @@ func (sa *SimulatedAnnealingScheduler) getAsksAndNodes(p PartitionView) ([]*obje
 	}
 	for _, n := range p.GetNodes() {
 		nodes = append(nodes, n)
+	}
+
+	if sa.MaxPendingAsks > 0 && len(asks) > sa.MaxPendingAsks {
+		log.Log(log.Scheduler).Debug("annealing ask limit applied",
+			zap.String("partition", p.GetName()),
+			zap.Int("pendingAsks", len(asks)),
+			zap.Int("limit", sa.MaxPendingAsks))
+		asks = asks[:sa.MaxPendingAsks]
 	}
 
 	return asks, nodes

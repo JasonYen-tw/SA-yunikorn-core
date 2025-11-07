@@ -1,24 +1,24 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The scheduler core lives under `pkg/`, grouped by domain (for example `pkg/scheduler` for placement logic, `pkg/webservice` for REST handlers, and `pkg/log` for logging utilities). CLI prototypes and tooling binaries live in `cmd/`. Cluster configuration templates and sample queue files sit under `config/`. Automation, lint helpers, and graph generators are in `scripts/`. Build artifacts and coverage reports are written to `build/`; keep it out of version control. Tests live next to source files with the `_test.go` suffix, so prefer co-locating new cases beside the code they exercise.
+Core scheduler logic lives in `pkg/`, grouped by domain (`pkg/scheduler`, `pkg/webservice`, `pkg/log`, etc.). CLI prototypes and helper binaries reside in `cmd/`. Cluster and queue templates sit under `config/`, while automation, graphs, and lint helpers live in `scripts/`. Build artifacts and coverage reports belong in `build/` (never commit). Tests are co-located with the code they exercise using the `_test.go` suffix; follow that layout when adding new packages.
 
 ## Build, Test, and Development Commands
-- `make build` compiles the sample binaries (`simplescheduler`, `schedulerclient`, `queueconfigchecker`) into `build/`.
-- `make test` runs `go test ./...` with race detection, deadlock tags, and writes `build/coverage.txt`.
-- `make lint` downloads and runs `golangci-lint` using `.golangci.yml`.
-- `make check_scripts` validates shell utilities via `shellcheck`.
-- `make clean` removes Go caches and the `build/` directory; run before packaging artifacts.
-Use `go test ./pkg/scheduler/... -run TestSomething` for focused investigation and `make bench` to execute benchmarks.
+- `make build`: compiles `simplescheduler`, `schedulerclient`, and `queueconfigchecker` into `build/`.
+- `make test`: runs `go test ./...` with the race detector, deadlock tags, and writes `build/coverage.txt`.
+- `make lint`: installs and runs `golangci-lint` using `.golangci.yml`; formats files via `goimports`.
+- `make check_scripts`: passes every shell helper through `shellcheck`.
+- `go test ./pkg/scheduler/... -run TestName`: narrow a failing suite; add `-count=1` when debugging caches.
+Use `make bench` for performance work, and `make clean` before publishing artifacts to ensure a fresh `build/`.
 
 ## Coding Style & Naming Conventions
-Target Go 1.21 as defined in `go.mod`. Format all files with `go fmt`/`goimports` (run automatically by `make lint`); tabs are the default indentation. Keep package names short and lowercase, exported identifiers in PascalCase, and locals in lowerCamelCase. Log through `pkg/log` rather than third-party loggers, and stick with `gotest.tools/v3/assert` for test assertions—`depguard` blocks `testify` and `logrus`.
+Target Go 1.21 as locked in `go.mod`. Keep tabs for indentation, run `go fmt`/`goimports` (or `make lint`) before committing, and keep package names lowercase. Exported identifiers use PascalCase, locals are lowerCamelCase, and test helpers start with `test`. Log exclusively through `pkg/log`. Assertions should rely on `gotest.tools/v3/assert` because `depguard` forbids `testify` and `logrus`.
 
 ## Testing Guidelines
-Name tests `Test<Component><Scenario>` and mirror the package structure. Ensure new logic is covered by unit tests and, when relevant, benchmarks. Always run `make test` before pushing; CI expects the race detector clean and coverage written. Add focused assertions instead of blanket `t.Fatal` to keep failure output actionable.
+Name tests `Test<Component><Scenario>` and mirror the package hierarchy for readability. Every feature PR must extend or add `_test.go` coverage, including failure paths. Run `make test` prior to pushing so the race detector stays green and `build/coverage.txt` is updated. Prefer table-driven tests; add focused benchmarks when you touch placement or scheduling hot paths.
 
 ## Commit & Pull Request Guidelines
-Recent history shows bracketed subjects such as `[Bug] json null`; follow that style for clarity (`[Feature]`, `[Refactor]`, etc.) and keep the summary under ~72 characters. Reference the relevant Apache JIRA ticket (`YUNIKORN-####`) or GitHub issue in the body, and describe observable impact and testing evidence. Pull requests should include a concise change overview, testing matrix (commands run), and links or screenshots when behavior changes. Double-check lint/test status and license headers before requesting review.
+Follow the bracketed subject convention from history (`[Feature]`, `[Bug]`, `[Refactor]`, etc.) and keep the summary <72 characters. Reference the relevant JIRA (`YUNIKORN-####`) or GitHub issue inside the body along with a short impact statement and the commands you ran. Pull requests should include: (1) change overview, (2) testing matrix, (3) screenshots or logs if behavior changes, and (4) confirmation that license headers remain intact.
 
-## Configuration Tips
-Queue and placement definitions live in `config/`. After updating them, rebuild `queueconfigchecker` (`make build`) and run `./build/queueconfigchecker -conf config/queues.yaml` to validate. Never commit environment-specific secrets; instead, document overrides in deployment guides.
+## Security & Configuration Tips
+Queue and placement definitions live in `config/`. After editing them, rebuild `queueconfigchecker` (`make build`) and validate with `./build/queueconfigchecker -conf config/queues.yaml`. Never commit environment-specific secrets; document overrides in deployment notes instead. Limit visibility of experimental tools by keeping prototypes inside `cmd/` until hardened.

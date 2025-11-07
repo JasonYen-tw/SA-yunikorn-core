@@ -33,10 +33,11 @@ import (
 )
 
 type AnnealingParams struct {
-	InitTemp   float64   `yaml:"initTemp"`
-	CoolRate   float64   `yaml:"coolRate"`
-	Iterations int       `yaml:"iterations"`
-	Weights    []float64 `yaml:"weights" json:"weights,omitempty"`
+	InitTemp       float64   `yaml:"initTemp"`
+	CoolRate       float64   `yaml:"coolRate"`
+	Iterations     int       `yaml:"iterations"`
+	Weights        []float64 `yaml:"weights" json:"weights,omitempty"`
+	MaxPendingAsks int       `yaml:"maxPendingAsks" json:"maxPendingAsks,omitempty"`
 }
 
 // The configuration can contain multiple partitions. Each partition contains the queue definition for a logical
